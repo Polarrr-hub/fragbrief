@@ -1,0 +1,119 @@
+name: Gemini Review
+
+# Cross-family second-opinion reviewer that fills the seat Codex's GitHub reviews
+# leave behind. Sends the (redacted) PR diff to the Gemini REST API and posts ONE
+# consolidated review comment (the summary-judgment role Codex played). Inline
+# line-by-line review stays CodeRabbit's job, so this does not duplicate it.
+#
+# Safety-gate maintenance workflow (explicitly owner-requested). Properties that
+# keep it inside repo policy (AGENTS.md):
+#   * Workflow token stays read-only (permissions: contents: read). The review
+#     comment is posted with a separate fine-grained PAT (GEMINI_REVIEW_TOKEN,
+#     this repo only, Pull requests: write).
+#   * The diff is scrubbed with the shared redactor (.github/scripts/redaction.cjs)
+#     BEFORE it leaves the runner, and the send is BLOCKED outright if a private
+#     key is detected — never put secrets in an external prompt (AGENTS.md rule).
+#   * The PR diff is framed as untrusted data in the prompt (no tools/agent, a
+#     plain completion call) to blunt prompt injection.
+#   * Fork PRs are intentionally NOT Gemini-reviewed: GitHub withholds secrets
+#     from fork runs, so the job cannot run, and untrusted fork code must never
+#     execute on the self-hosted runner. CodeRabbit/Codex still cover forks.
+#
+# The send-safety logic lives in .github/scripts/gemini-review.mjs and is unit
+# tested (.github/scripts/gemini-review.test.ts). Deliberately minimal: Node 22
+# (already used across CI) with built-in fetch — no agent CLI, no npx, no Docker,
+# no new Action dependency. Runs on the existing self-hosted runner (zero minutes).
+#
+# Prerequisites (repo/org secrets): GEMINI_API_KEY (Google AI Studio) and
+# GEMINI_REVIEW_TOKEN (fine-grained PAT). The job no-ops cleanly if either is
+# missing.
+
+on:
+  pull_request:
+    types: [opened, ready_for_review, reopened, synchronize]
+    branches:
+      - main
+
+concurrency:
+  group: gemini-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  gemini-review:
+    name: Gemini Review
+    # Skip drafts and fork PRs (forks get no secrets and must not run here).
+    if: >-
+      github.event.pull_request.draft == false &&
+      github.event.pull_request.head.repo.fork == false
+    timeout-minutes: 10
+    runs-on: [self-hosted, linux]
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          # fetch-depth 0 + default credentials so the diff step can `git fetch`
+          # the base branch (mirrors the pr-size job in ci.yml).
+          fetch-depth: 0
+
+      - name: Set up Node
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
+        with:
+          node-version: "22"
+
+      - name: Guard on required secrets
+        id: guard
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_REVIEW_TOKEN: ${{ secrets.GEMINI_REVIEW_TOKEN }}
+        run: |
+          if [ -z "${GEMINI_API_KEY}" ] || [ -z "${GEMINI_REVIEW_TOKEN}" ]; then
+            echo "GEMINI_API_KEY and/or GEMINI_REVIEW_TOKEN not set — skipping Gemini review." >&2
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Collect diff and pin review code to the base branch
+        id: collect
+        if: steps.guard.outputs.enabled == 'true'
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags --quiet origin "${BASE_REF}"
+          # FAIL CLOSED: only run with secrets when the TRUSTED base-branch versions of
+          # the secret-handling code exist, so a same-repo PR can never modify them to
+          # exfiltrate GEMINI_API_KEY / GEMINI_REVIEW_TOKEN. On the bootstrap PR that
+          # introduces these files they are not on the base branch yet, so we SKIP the
+          # review entirely rather than run PR-controlled code with secrets. (This PR is
+          # still reviewed by CodeRabbit / Codex / humans.)
+          for f in .github/scripts/gemini-review.mjs .github/scripts/redaction.cjs; do
+            if ! git cat-file -e "origin/${BASE_REF}:${f}" 2>/dev/null; then
+              echo "::notice::${f} not on ${BASE_REF} yet — skipping Gemini review until the trusted base copy exists."
+              echo "trusted=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          done
+          # Run the trusted base versions, never the PR's, on the secret-bearing path.
+          git checkout "origin/${BASE_REF}" -- .github/scripts/gemini-review.mjs .github/scripts/redaction.cjs
+          echo "trusted=true" >> "$GITHUB_OUTPUT"
+          # Three-dot: only the changes the PR introduces since the merge-base.
+          git diff "origin/${BASE_REF}...HEAD" > diff.patch
+          # Pull the review standard from the BASE branch, not the PR head, so a
+          # PR cannot rewrite the rules it will be judged against.
+          for f in CLAUDE.md AGENTS.md; do
+            git show "origin/${BASE_REF}:${f}" > "base_${f}" 2>/dev/null || : > "base_${f}"
+          done
+
+      - name: Run Gemini review and post comment
+        # Only with secrets present AND the trusted base copy of the review code in use.
+        if: steps.guard.outputs.enabled == 'true' && steps.collect.outputs.trusted == 'true'
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          # Separate fine-grained PAT so the workflow's own token stays read-only.
+          GEMINI_REVIEW_TOKEN: ${{ secrets.GEMINI_REVIEW_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: node .github/scripts/gemini-review.mjs
